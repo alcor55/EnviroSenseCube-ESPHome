@@ -1,0 +1,160 @@
+esphome:
+  name: envirosensecube
+  friendly_name: EnviroSenseCube
+  comment: Battery-powered BME688 environmental monitor
+
+esp8266:
+  board: huzzah
+  # Enables the 512-byte ESP8266 preference area. Runtime state still uses
+  # explicitly selected RTC preferences inside the custom component.
+  restore_from_flash: true
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [envirosense_cube]
+
+logger:
+  level: INFO
+  baud_rate: 115200
+  logs:
+    wifi: WARN
+    api: WARN
+    api.connection: WARN
+    api.service: WARN
+    envirosense_cube: INFO
+    envirosense_epaper: INFO
+
+api:
+  reboot_timeout: 0s
+  encryption:
+    key: !secret api_encryption_key
+  on_client_connected:
+    then:
+      - lambda: |-
+          id(envirosensecube_core).notify_api_client_connected(client_info, client_address);
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  id: wifi_control
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  enable_on_boot: false
+  reboot_timeout: 0s
+  fast_connect: true
+  power_save_mode: light
+  manual_ip:
+    static_ip: 192.168.1.31
+    gateway: 192.168.1.1
+    subnet: 255.255.255.0
+    dns1: 192.168.1.1
+
+deep_sleep:
+  id: deep_sleep_control
+  sleep_duration: 300s
+
+binary_sensor:
+  - platform: homeassistant
+    id: ota_maintenance_request
+    entity_id: input_boolean.envirosensecube_ota_mode
+    internal: true
+    trigger_on_initial_state: true
+    on_state:
+      then:
+        - lambda: |-
+            id(envirosensecube_core).set_ota_maintenance(x);
+        - switch.template.publish:
+            id: ota_maintenance_control
+            state: !lambda return x;
+
+switch:
+  - platform: template
+    id: ota_maintenance_control
+    name: OTA Maintenance Mode
+    icon: mdi:update
+    entity_category: config
+    optimistic: false
+    lambda: |-
+      if (!id(ota_maintenance_request).has_state())
+        return {};
+      return id(ota_maintenance_request).state;
+    turn_on_action:
+      - homeassistant.action:
+          action: input_boolean.turn_on
+          data:
+            entity_id: input_boolean.envirosensecube_ota_mode
+    turn_off_action:
+      - homeassistant.action:
+          action: input_boolean.turn_off
+          data:
+            entity_id: input_boolean.envirosensecube_ota_mode
+
+button:
+  - platform: template
+    id: refresh_display
+    name: Refresh Display
+    icon: mdi:refresh
+    entity_category: diagnostic
+    on_press:
+      then:
+        - lambda: |-
+            id(envirosensecube_core).request_display_refresh();
+  - platform: template
+    id: save_bsec_state
+    name: Save BSEC State
+    icon: mdi:content-save
+    entity_category: diagnostic
+    on_press:
+      then:
+        - lambda: |-
+            id(envirosensecube_core).save_bsec_state_to_flash();
+
+sensor:
+  - platform: envirosense_cube
+    id: envirosensecube_core
+    deep_sleep_id: deep_sleep_control
+    temperature_offset: -2.3
+    humidity_offset: 0.0
+    pressure_offset: 0.0
+    temperature_threshold: 0.1
+    humidity_threshold: 0.5
+    pressure_threshold: 0.5
+    static_iaq_threshold: 10.0
+    battery_threshold: 5.0
+    temperature:
+      name: Temperature
+    humidity:
+      name: Humidity
+    pressure:
+      name: Pressure
+    gas_resistance:
+      name: Gas Resistance
+      icon: mdi:omega
+    static_iaq:
+      name: Static IAQ
+    adaptive_iaq:
+      name: Adaptive IAQ
+    iaq_accuracy:
+      name: IAQ Accuracy
+    co2_equivalent:
+      name: CO2 Equivalent
+    breath_voc_equivalent:
+      name: Breath VOC Equivalent
+    battery:
+      name: Battery
+    battery_raw:
+      name: Battery Raw
+    battery_voltage:
+      name: Battery Voltage
+    battery_valid:
+      name: Battery Reading Valid
+    bsec_stabilized:
+      name: BSEC Stabilized
+    bsec_run_in_complete:
+      name: BSEC Run In Complete
+    ota_maintenance_active:
+      name: OTA Maintenance Active

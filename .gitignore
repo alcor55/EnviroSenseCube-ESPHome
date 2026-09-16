@@ -1,0 +1,10 @@
+.esphome/
+secrets.yaml
+*.bin
+*.elf
+*.map
+*.py[cod]
+__pycache__/
+.DS_Store
+.pio/
+.pioenvs/
