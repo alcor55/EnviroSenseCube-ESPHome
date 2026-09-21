@@ -67,8 +67,10 @@ class EnviroSenseCube : public Component {
   static constexpr uint32_t BSEC_FLASH_STATE_KEY = 0xEC5CE503;
   static constexpr uint8_t BATTERY_HISTORY_VALUES = 8;
   static constexpr uint8_t BATTERY_SAMPLES = 3;
-  static constexpr uint8_t DISPLAY_MIN_CYCLES = 1;
-  static constexpr uint8_t DISPLAY_FULL_REFRESH_CYCLES = 6;
+  // Film J only supports a slow global refresh. Coalesce measurement changes
+  // for at least 30 minutes and force a refresh every six hours.
+  static constexpr uint8_t DISPLAY_MIN_CYCLES = 6;
+  static constexpr uint8_t DISPLAY_FULL_REFRESH_CYCLES = 72;
   static constexpr uint8_t HEARTBEAT_CYCLES = 6;
   static constexpr uint8_t BSEC_FLASH_CHECKPOINT_CYCLES = 72;
   static constexpr uint8_t BSEC_FLASH_NOT_SAVED = 0xFF;
@@ -164,14 +166,14 @@ class EnviroSenseCube : public Component {
   float decode_half_unit_(uint8_t value) const;
   float median_(const float values[], uint8_t count) const;
   bool draw_display_(bool force_full_refresh);
-  void draw_decimal_value_(float value, int16_t cell_x, int16_t cell_width, int16_t text_y,
-                           const uint8_t *icon, int16_t fixed_icon_x = -1,
-                           int16_t number_x_offset = 0);
-  void draw_integer_value_(float value, int16_t cell_x, int16_t cell_width, int16_t text_y,
-                           const uint8_t *icon, uint8_t text_width, int16_t fixed_icon_x = -1);
-  void draw_display_content_(float temperature, float humidity, float pressure, float static_iaq,
+  void draw_decimal_value_(GFXcanvas1 &black_canvas, GFXcanvas1 &red_canvas, float value,
+                           int16_t text_y, const uint8_t *icon, int16_t fixed_icon_x);
+  void draw_integer_value_(GFXcanvas1 &red_canvas, GFXcanvas1 &target, float value,
+                           int16_t text_y, const uint8_t *icon, uint8_t text_width,
+                           int16_t fixed_icon_x);
+  void draw_display_content_(GFXcanvas1 &black_canvas, GFXcanvas1 &red_canvas,
+                             float temperature, float humidity, float pressure, float static_iaq,
                              float battery, bool battery_valid);
-  bool canvas_to_byte_array_(uint8_t *buffer);
   void capture_display_snapshot_();
 
   deep_sleep::DeepSleepComponent *deep_sleep_{nullptr};
@@ -195,7 +197,6 @@ class EnviroSenseCube : public Component {
   static EnviroSenseCube *active_bsec_instance_;
   Bsec2 bsec_;
   PersistentLC709203F battery_gauge_;
-  GFXcanvas1 canvas_;
   ESPPreferenceObject rtc_preference_;
   ESPPreferenceObject bsec_flash_preference_;
   SupportData support_data_{};

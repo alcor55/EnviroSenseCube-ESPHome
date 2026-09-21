@@ -7,7 +7,7 @@
 #include <cstring>
 #include <new>
 
-#include "GDEW0097T50_lib.h"
+#include "E2154JS0C1_lib.h"
 #include "icon_air_quality.h"
 #include "icon_humidity.h"
 #include "icon_pressure.h"
@@ -25,10 +25,9 @@ static constexpr uint8_t BUSY_PIN = 12;
 static constexpr uint8_t RST_PIN = 0;
 static constexpr uint8_t DC_PIN = 15;
 static constexpr uint8_t CS_PIN = 2;
-static constexpr uint8_t DISPLAY_WIDTH = 184;
-static constexpr uint8_t DISPLAY_HEIGHT = 88;
-static constexpr uint16_t DISPLAY_BUFFER_SIZE = DISPLAY_WIDTH * DISPLAY_HEIGHT / 8;
-static constexpr uint32_t DISPLAY_OPERATION_TIMEOUT_MS = 20000;
+static constexpr uint16_t DISPLAY_WIDTH = e2154js0c1::WIDTH;
+static constexpr uint16_t DISPLAY_HEIGHT = e2154js0c1::HEIGHT;
+static constexpr uint32_t DISPLAY_OPERATION_TIMEOUT_MS = 40000;
 
 static constexpr uint32_t OTA_WINDOW_MS = 20000;
 static constexpr uint32_t OTA_MAINTENANCE_START_DELAY_MS = 0;
@@ -103,7 +102,7 @@ bool PersistentLC709203F::set_cell_temperature(float temperature_c) {
   return this->writeWord(LC709203F_CMD_CELLTEMPERATURE, temperature_kelvin_x10);
 }
 
-EnviroSenseCube::EnviroSenseCube() : canvas_(DISPLAY_WIDTH, DISPLAY_HEIGHT) {}
+EnviroSenseCube::EnviroSenseCube() = default;
 
 float EnviroSenseCube::get_setup_priority() const { return setup_priority::LATE + 1.0f; }
 
@@ -326,9 +325,10 @@ void EnviroSenseCube::dump_config() {
                 "  OTA-maintenance sensor start delay: none\n"
                 "  Diagnostic stay-awake mode: disabled\n"
                 "  Heartbeat: 6 cycles (30 minutes)\n"
-                "  Display: no local graphs; partial refresh with full cleanup every 6 cycles\n"
-                "  Display minimum interval: 1 cycle (5 minutes)\n"
-                "  Display operation timeout: 20 seconds\n"
+                "  Display: E2154JS0C1 152x152 black/white/red; global update only\n"
+                "  Display minimum interval: 6 cycles (30 minutes)\n"
+                "  Display forced refresh: 72 cycles (6 hours)\n"
+                "  Display operation timeout: 40 seconds\n"
                 "  WiFi/API timeouts: 15/45 seconds\n"
                 "  Offsets T/H/P: %.1f C / %.1f %% / %.1f hPa\n"
                 "  Publish thresholds T/H/P/IAQ/battery: %.1f / %.1f / %.1f / %.1f / %.1f\n"
@@ -586,9 +586,9 @@ void EnviroSenseCube::complete_measurement_cycle_() {
 
   const bool environment_changed = this->environment_threshold_exceeded_();
   const bool battery_changed = this->battery_threshold_exceeded_();
-  const bool periodic_display_cleanup_due =
+  const bool periodic_display_refresh_due =
       this->support_data_.display_update_count >= DISPLAY_FULL_REFRESH_CYCLES;
-  const bool full_refresh_due = periodic_display_cleanup_due || this->manual_display_refresh_requested_;
+  const bool full_refresh_due = periodic_display_refresh_due || this->manual_display_refresh_requested_;
   const bool heartbeat_due =
       this->support_data_.cycles_since_publish_attempt >= HEARTBEAT_CYCLES;
   const bool publish_due = environment_changed || battery_changed || heartbeat_due;
@@ -613,11 +613,11 @@ void EnviroSenseCube::complete_measurement_cycle_() {
       ESP_LOGI(TAG, "Display update completed successfully");
     } else {
       this->support_data_.display_cycles_since_update = 0;
-      ESP_LOGW(TAG, "Display update aborted; retry deferred by two cycles");
+      ESP_LOGW(TAG, "Display update aborted; retry deferred by the normal display interval");
     }
   }
 
-  if (periodic_display_cleanup_due) {
+  if (heartbeat_due) {
     // GPIO2 drives both the active-low blue LED and the e-paper chip select.
     // Blink only after the display transaction has completed and SPI is idle.
     pinMode(CS_PIN, OUTPUT);
@@ -928,30 +928,12 @@ void EnviroSenseCube::enter_sleep_() {
     this->deep_sleep_->begin_sleep();
 }
 
-bool EnviroSenseCube::canvas_to_byte_array_(uint8_t *buffer) {
-  if (buffer == nullptr)
-    return false;
-  memset(buffer, 0, DISPLAY_BUFFER_SIZE);
-  for (uint8_t x = 0; x < DISPLAY_WIDTH; x++) {
-    for (uint8_t y = 0; y < DISPLAY_HEIGHT; y++) {
-      const int byte_position = (x * DISPLAY_HEIGHT + y) / 8;
-      const int bit_position = 7 - y % 8;
-      // The panel scan direction is horizontally mirrored relative to GFX.
-      if (this->canvas_.getPixel(DISPLAY_WIDTH - x - 1, y))
-        buffer[byte_position] |= 1 << bit_position;
-    }
-  }
-
-  return true;
-}
-
-void EnviroSenseCube::draw_decimal_value_(float value, int16_t cell_x, int16_t cell_width,
-                                          int16_t text_y, const uint8_t *icon,
-                                          int16_t fixed_icon_x, int16_t number_x_offset) {
-  static constexpr uint8_t INTEGER_TEXT_WIDTH = 4;
-  static constexpr uint8_t INTEGER_TEXT_HEIGHT = 4;
-  static constexpr uint8_t FRACTION_TEXT_WIDTH = 3;
-  static constexpr uint8_t FRACTION_TEXT_HEIGHT = 3;
+void EnviroSenseCube::draw_decimal_value_(GFXcanvas1 &black_canvas, GFXcanvas1 &red_canvas,
+                                          float value, int16_t text_y, const uint8_t *icon,
+                                          int16_t fixed_icon_x) {
+  static constexpr uint8_t INTEGER_TEXT_HEIGHT = 3;
+  static constexpr uint8_t FRACTION_TEXT_WIDTH = 2;
+  static constexpr uint8_t FRACTION_TEXT_HEIGHT = 2;
   static constexpr int16_t ICON_WIDTH = 12;
   static constexpr int16_t ICON_HEIGHT = 17;
   static constexpr int16_t ICON_GAP = 2;
@@ -960,29 +942,26 @@ void EnviroSenseCube::draw_decimal_value_(float value, int16_t cell_x, int16_t c
   char integer_text[8];
   snprintf(integer_text, sizeof(integer_text), scaled < 0 ? "-%lu" : "%lu",
            static_cast<unsigned long>(magnitude / 10));
-  const int16_t integer_width = strlen(integer_text) * 6 * INTEGER_TEXT_WIDTH;
+  const uint8_t integer_text_width = strlen(integer_text) > 2 ? 2 : 3;
+  const int16_t integer_width = strlen(integer_text) * 6 * integer_text_width;
   const int16_t fraction_width = 6 * FRACTION_TEXT_WIDTH;
   const int16_t number_width = integer_width + 3 + fraction_width;
-  const int16_t group_width = ICON_WIDTH + ICON_GAP + number_width;
-  const int16_t centered_number_x = cell_x + (cell_width - group_width) / 2;
-  const int16_t icon_x = fixed_icon_x >= 0 ? fixed_icon_x : centered_number_x + number_width + ICON_GAP;
-  const int16_t number_x =
-      (fixed_icon_x >= 0 ? icon_x - ICON_GAP - number_width : centered_number_x) + number_x_offset;
-  const int16_t fraction_y = text_y + 7;
-  this->canvas_.drawBitmap(icon_x, text_y, icon, ICON_WIDTH, ICON_HEIGHT, 0);
-  this->canvas_.setTextSize(INTEGER_TEXT_WIDTH, INTEGER_TEXT_HEIGHT);
-  this->canvas_.setCursor(number_x, text_y);
-  this->canvas_.print(integer_text);
-  this->canvas_.fillRect(number_x + integer_width - 1, text_y + 24, 2, 3, 0);
-  this->canvas_.setTextSize(FRACTION_TEXT_WIDTH, FRACTION_TEXT_HEIGHT);
-  this->canvas_.setCursor(number_x + integer_width + 3, fraction_y);
-  this->canvas_.print(static_cast<uint8_t>(magnitude % 10));
+  const int16_t number_x = fixed_icon_x - ICON_GAP - number_width;
+  const int16_t fraction_y = text_y + 8;
+  red_canvas.drawBitmap(fixed_icon_x, text_y + 3, icon, ICON_WIDTH, ICON_HEIGHT, 1);
+  black_canvas.setTextSize(integer_text_width, INTEGER_TEXT_HEIGHT);
+  black_canvas.setCursor(number_x, text_y);
+  black_canvas.print(integer_text);
+  black_canvas.fillRect(number_x + integer_width, text_y + 19, 2, 2, 0);
+  black_canvas.setTextSize(FRACTION_TEXT_WIDTH, FRACTION_TEXT_HEIGHT);
+  black_canvas.setCursor(number_x + integer_width + 3, fraction_y);
+  black_canvas.print(static_cast<uint8_t>(magnitude % 10));
 }
 
-void EnviroSenseCube::draw_integer_value_(float value, int16_t cell_x, int16_t cell_width,
-                                          int16_t text_y, const uint8_t *icon,
+void EnviroSenseCube::draw_integer_value_(GFXcanvas1 &red_canvas, GFXcanvas1 &target,
+                                          float value, int16_t text_y, const uint8_t *icon,
                                           uint8_t text_width, int16_t fixed_icon_x) {
-  static constexpr uint8_t INTEGER_TEXT_HEIGHT = 4;
+  static constexpr uint8_t INTEGER_TEXT_HEIGHT = 3;
   static constexpr int16_t ICON_WIDTH = 12;
   static constexpr int16_t ICON_HEIGHT = 17;
   static constexpr int16_t ICON_GAP = 2;
@@ -992,57 +971,66 @@ void EnviroSenseCube::draw_integer_value_(float value, int16_t cell_x, int16_t c
   else
     snprintf(value_text, sizeof(value_text), "---");
   const int16_t number_width = strlen(value_text) * 6 * text_width;
-  const int16_t group_width = ICON_WIDTH + ICON_GAP + number_width;
-  const int16_t centered_number_x = cell_x + (cell_width - group_width) / 2;
-  const int16_t icon_x = fixed_icon_x >= 0 ? fixed_icon_x : centered_number_x + number_width + ICON_GAP;
-  const int16_t number_x = fixed_icon_x >= 0 ? icon_x - ICON_GAP - number_width : centered_number_x;
-  this->canvas_.drawBitmap(icon_x, text_y, icon, ICON_WIDTH, ICON_HEIGHT, 0);
-  this->canvas_.setTextSize(text_width, INTEGER_TEXT_HEIGHT);
-  this->canvas_.setCursor(number_x, text_y);
-  this->canvas_.print(value_text);
+  const int16_t number_x = fixed_icon_x - ICON_GAP - number_width;
+  red_canvas.drawBitmap(fixed_icon_x, text_y + 3, icon, ICON_WIDTH, ICON_HEIGHT, 1);
+  target.setTextSize(text_width, INTEGER_TEXT_HEIGHT);
+  target.setCursor(number_x, text_y);
+  target.print(value_text);
 }
 
-void EnviroSenseCube::draw_display_content_(float temperature, float humidity, float pressure,
+void EnviroSenseCube::draw_display_content_(GFXcanvas1 &black_canvas, GFXcanvas1 &red_canvas,
+                                            float temperature, float humidity, float pressure,
                                             float static_iaq, float battery, bool battery_valid) {
-  this->canvas_.setTextColor(0);
-  this->canvas_.setFont();
-  this->canvas_.fillScreen(1);
+  black_canvas.setFont();
+  black_canvas.setTextColor(0);
+  black_canvas.fillScreen(1);
+  red_canvas.setFont();
+  red_canvas.setTextColor(1);
+  red_canvas.fillScreen(0);
 
-  this->draw_decimal_value_(temperature, 5, 88, 1, ICON_TEMPERATURE);
-  this->draw_decimal_value_(humidity, 96, 88, 1, ICON_HUMIDITY, 172, 2);
-  this->draw_integer_value_(pressure, -2, 101, 42, ICON_PRESSURE, 3);
-  this->draw_integer_value_(static_iaq, 97, 88, 42, ICON_AIR_QUALITY, 4, 172);
+  // Two rows of measurements. Values remain black; icons and short accents
+  // use the red plane. The right edge of each icon is kept inside its cell.
+  this->draw_decimal_value_(black_canvas, red_canvas, temperature, 12, ICON_TEMPERATURE, 61);
+  this->draw_decimal_value_(black_canvas, red_canvas, humidity, 12, ICON_HUMIDITY, 137);
+  this->draw_integer_value_(red_canvas, black_canvas, pressure, 80, ICON_PRESSURE, 2, 61);
+  GFXcanvas1 &iaq_canvas =
+      std::isfinite(static_iaq) && static_iaq >= 100.0f ? red_canvas : black_canvas;
+  this->draw_integer_value_(red_canvas, iaq_canvas, static_iaq, 80, ICON_AIR_QUALITY, 3, 137);
 
-  // Compact horizontal battery icon at the lower-left edge.
-  static constexpr int16_t BATTERY_ICON_X = 0;
-  static constexpr int16_t BATTERY_ICON_Y = 80;
-  static constexpr int16_t BATTERY_ICON_BODY_WIDTH = 14;
+  red_canvas.drawFastHLine(21, 46, 34, 1);
+  red_canvas.drawFastHLine(97, 46, 34, 1);
+  red_canvas.drawFastHLine(21, 114, 34, 1);
+  red_canvas.drawFastHLine(97, 114, 34, 1);
+
+  // Compact battery indicator along the lower edge.
+  static constexpr int16_t BATTERY_ICON_X = 2;
+  static constexpr int16_t BATTERY_ICON_Y = 140;
+  static constexpr int16_t BATTERY_ICON_BODY_WIDTH = 12;
   static constexpr int16_t BATTERY_ICON_HEIGHT = 8;
-  static constexpr int16_t BATTERY_BAR_X = 21;
-  static constexpr int16_t BATTERY_BAR_Y = 81;
+  static constexpr int16_t BATTERY_BAR_X = 20;
+  static constexpr int16_t BATTERY_BAR_Y = 141;
   static constexpr int16_t BATTERY_BAR_HEIGHT = 7;
-  static constexpr int16_t BATTERY_BAR_WIDTH = DISPLAY_WIDTH - BATTERY_BAR_X;
+  static constexpr int16_t BATTERY_BAR_WIDTH = DISPLAY_WIDTH - BATTERY_BAR_X - 2;
 
-  this->canvas_.fillRect(BATTERY_ICON_X, BATTERY_ICON_Y, BATTERY_ICON_BODY_WIDTH, 2, 0);
-  this->canvas_.fillRect(BATTERY_ICON_X, BATTERY_ICON_Y + BATTERY_ICON_HEIGHT - 2,
-                         BATTERY_ICON_BODY_WIDTH, 2, 0);
-  this->canvas_.fillRect(BATTERY_ICON_X, BATTERY_ICON_Y, 2, BATTERY_ICON_HEIGHT, 0);
-  this->canvas_.fillRect(BATTERY_ICON_X + BATTERY_ICON_BODY_WIDTH - 2, BATTERY_ICON_Y, 2,
-                         BATTERY_ICON_HEIGHT, 0);
-  this->canvas_.fillRect(BATTERY_ICON_X + BATTERY_ICON_BODY_WIDTH, BATTERY_ICON_Y + 2, 2, 4, 0);
-  this->canvas_.fillRect(BATTERY_BAR_X, BATTERY_BAR_Y, BATTERY_BAR_WIDTH, 2, 0);
-  this->canvas_.fillRect(BATTERY_BAR_X, BATTERY_BAR_Y + BATTERY_BAR_HEIGHT - 2,
-                         BATTERY_BAR_WIDTH, 2, 0);
-  this->canvas_.fillRect(BATTERY_BAR_X, BATTERY_BAR_Y, 2, BATTERY_BAR_HEIGHT, 0);
-  this->canvas_.fillRect(BATTERY_BAR_X + BATTERY_BAR_WIDTH - 2, BATTERY_BAR_Y, 2,
-                         BATTERY_BAR_HEIGHT, 0);
+  red_canvas.drawRect(BATTERY_ICON_X, BATTERY_ICON_Y, BATTERY_ICON_BODY_WIDTH,
+                      BATTERY_ICON_HEIGHT, 1);
+  red_canvas.drawRect(BATTERY_ICON_X + 1, BATTERY_ICON_Y + 1,
+                      BATTERY_ICON_BODY_WIDTH - 2, BATTERY_ICON_HEIGHT - 2, 1);
+  red_canvas.fillRect(BATTERY_ICON_X + BATTERY_ICON_BODY_WIDTH,
+                      BATTERY_ICON_Y + 2, 2, 4, 1);
+  black_canvas.drawRect(BATTERY_BAR_X, BATTERY_BAR_Y, BATTERY_BAR_WIDTH,
+                        BATTERY_BAR_HEIGHT, 0);
 
   if (battery_valid && std::isfinite(battery)) {
     const float bounded_battery = std::max(0.0f, std::min(100.0f, battery));
     const int16_t battery_width = static_cast<int16_t>(
         roundf(bounded_battery * static_cast<float>(BATTERY_BAR_WIDTH - 4) / 100.0f));
-    if (battery_width > 0)
-      this->canvas_.fillRect(BATTERY_BAR_X + 2, BATTERY_BAR_Y + 2, battery_width, 3, 0);
+    if (battery_width > 0) {
+      if (bounded_battery <= 20.0f)
+        red_canvas.fillRect(BATTERY_BAR_X + 2, BATTERY_BAR_Y + 2, battery_width, 3, 1);
+      else
+        black_canvas.fillRect(BATTERY_BAR_X + 2, BATTERY_BAR_Y + 2, battery_width, 3, 0);
+    }
   }
 }
 
@@ -1068,95 +1056,50 @@ void EnviroSenseCube::capture_display_snapshot_() {
 }
 
 bool EnviroSenseCube::draw_display_(bool force_full_refresh) {
-  uint8_t *new_buffer = static_cast<uint8_t *>(malloc(DISPLAY_BUFFER_SIZE));
-  if (new_buffer == nullptr) {
-    ESP_LOGW(TAG, "New display buffer allocation failed");
+  (void) force_full_refresh;
+  GFXcanvas1 black_canvas(DISPLAY_WIDTH, DISPLAY_HEIGHT);
+  GFXcanvas1 red_canvas(DISPLAY_WIDTH, DISPLAY_HEIGHT);
+  if (black_canvas.getBuffer() == nullptr || red_canvas.getBuffer() == nullptr) {
+    ESP_LOGW(TAG, "Tri-colour display buffer allocation failed; free heap=%u", ESP.getFreeHeap());
     return false;
   }
-  this->draw_display_content_(this->temperature_, this->humidity_, this->pressure_, this->static_iaq_,
-                              this->battery_filtered_, this->battery_valid_);
-  if (!this->canvas_to_byte_array_(new_buffer)) {
-    free(new_buffer);
-    return false;
-  }
-
-  DisplaySnapshot &snapshot = this->support_data_.display_snapshot;
-  const bool snapshot_valid =
-      (snapshot.flags & DISPLAY_SNAPSHOT_VALID) != 0 &&
-      (snapshot.flags & DISPLAY_SNAPSHOT_LAYOUT_MASK) == DISPLAY_SNAPSHOT_LAYOUT_CURRENT;
-  if ((snapshot.flags & DISPLAY_SNAPSHOT_VALID) != 0 && !snapshot_valid)
-    ESP_LOGI(TAG, "Display layout changed; forcing one full refresh");
-  const bool use_partial_refresh = snapshot_valid && !force_full_refresh;
-  uint8_t *old_buffer = nullptr;
-  if (use_partial_refresh) {
-    old_buffer = static_cast<uint8_t *>(malloc(DISPLAY_BUFFER_SIZE));
-    if (old_buffer == nullptr) {
-      ESP_LOGW(TAG, "Old display buffer allocation failed; using full refresh");
-    } else {
-      const float previous_iaq = (snapshot.flags & DISPLAY_SNAPSHOT_IAQ_VALID) != 0
-                                     ? snapshot.static_iaq
-                                     : NAN;
-      this->draw_display_content_(snapshot.temperature_x10 / 10.0f, snapshot.humidity_x10 / 10.0f,
-                                  snapshot.pressure_x10 / 10.0f, previous_iaq,
-                                  snapshot.battery_x2 / 2.0f,
-                                  (snapshot.flags & DISPLAY_SNAPSHOT_BATTERY_VALID) != 0);
-      this->canvas_to_byte_array_(old_buffer);
-    }
-  }
+  this->draw_display_content_(black_canvas, red_canvas, this->temperature_, this->humidity_,
+                              this->pressure_, this->static_iaq_, this->battery_filtered_,
+                              this->battery_valid_);
 
   pinMode(RST_PIN, OUTPUT);
   pinMode(DC_PIN, OUTPUT);
   pinMode(CS_PIN, OUTPUT);
   SPI.begin();
   pinMode(BUSY_PIN, INPUT);
-  SPI.beginTransaction(SPISettings(10000000, MSBFIRST, SPI_MODE0));
+  SPI.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
 
   const uint32_t display_started_at = millis();
-  bool display_ok = true;
-  bool partial_attempted = use_partial_refresh && old_buffer != nullptr;
-  ESP_LOGI(TAG, "E-paper transaction: %s refresh BUSY=%d",
-           partial_attempted ? "full-screen partial" : "full", digitalRead(BUSY_PIN));
-  EPD_BeginOperation(DISPLAY_OPERATION_TIMEOUT_MS);
-
-  if (partial_attempted)
-    display_ok = EPD_SetRAMValue_Partial(old_buffer, new_buffer);
-  else {
-    display_ok = EPD_Init();
-    if (display_ok)
-      display_ok = EPD_SetRAMValue_BaseMap(new_buffer);
-  }
-
-  if (!display_ok && partial_attempted && !EPD_OperationTimedOut()) {
-    ESP_LOGW(TAG, "Partial refresh failed; retrying once with a full refresh");
-    EPD_BeginOperation(DISPLAY_OPERATION_TIMEOUT_MS);
-    display_ok = EPD_Init();
-    if (display_ok)
-      display_ok = EPD_SetRAMValue_BaseMap(new_buffer);
-    partial_attempted = false;
-  }
-  if (display_ok)
-    display_ok = EPD_DeepSleep();
-  if (display_ok &&
-      (EPD_OperationTimedOut() || millis() - display_started_at >= DISPLAY_OPERATION_TIMEOUT_MS)) {
+  ESP_LOGI(TAG, "E-paper transaction: E2154JS0C1 black/white/red global refresh BUSY=%d",
+           digitalRead(BUSY_PIN));
+  e2154js0c1::begin_operation(DISPLAY_OPERATION_TIMEOUT_MS);
+  const int8_t panel_temperature = std::isfinite(this->temperature_)
+                                       ? static_cast<int8_t>(lroundf(this->temperature_))
+                                       : 25;
+  bool display_ok =
+      e2154js0c1::update(black_canvas.getBuffer(), red_canvas.getBuffer(), panel_temperature);
+  if (display_ok && (e2154js0c1::operation_timed_out() ||
+                     millis() - display_started_at >= DISPLAY_OPERATION_TIMEOUT_MS)) {
     ESP_LOGE(TAG, "E-paper total operation limit reached after %lu ms", millis() - display_started_at);
     display_ok = false;
   }
   if (!display_ok)
-    EPD_ForceSleep();
-  EPD_EndOperation();
+    e2154js0c1::force_power_off();
+  e2154js0c1::end_operation();
 
   SPI.endTransaction();
   SPI.end();
-  free(old_buffer);
-  free(new_buffer);
   if (display_ok) {
     this->capture_display_snapshot_();
-    if (!partial_attempted)
-      this->support_data_.display_update_count = 0;
+    this->support_data_.display_update_count = 0;
   }
-  ESP_LOGI(TAG, "E-paper transaction finished: mode=%s success=%s elapsed=%lu ms BUSY=%d",
-           partial_attempted ? "partial" : "full", YESNO(display_ok),
-           millis() - display_started_at, digitalRead(BUSY_PIN));
+  ESP_LOGI(TAG, "E-paper transaction finished: mode=global-bwr success=%s elapsed=%lu ms BUSY=%d",
+           YESNO(display_ok), millis() - display_started_at, digitalRead(BUSY_PIN));
   return display_ok;
 }
 

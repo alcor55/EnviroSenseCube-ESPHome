@@ -1,7 +1,12 @@
-# EnviroSenseCube ESPHome
+# EnviroSenseCube ESPHome - E2154JS0C1
 
-Firmware ESPHome per il monitor ambientale a batteria EnviroSenseCube, basato
-su ESP8266, BME688, BSEC2, fuel gauge LC709203F e display e-paper da 0,97".
+Variante del firmware ESPHome per il monitor ambientale a batteria
+EnviroSenseCube, basata su ESP8266, BME688, BSEC2, fuel gauge LC709203F e
+display e-paper Pervasive Displays E2154JS0C1 a tre colori.
+
+La branch Git si chiama `ESPHome-SE2154JS0C1` per seguire il nome richiesto;
+il codice prodotto ufficiale del pannello è però **E2154JS0C1**, senza `S`
+iniziale.
 
 Questa implementazione usa la Native API di ESPHome: Home Assistant crea
 direttamente le entità del dispositivo, senza webhook, MQTT, `input_text` o
@@ -14,7 +19,8 @@ sensori template.
 | MCU | Adafruit HUZZAH ESP8266 |
 | Sensore ambientale | Bosch BME688, I2C `0x77` |
 | Fuel gauge | Adafruit LC709203F, I2C `0x0B` |
-| Display | Good Display GDEW0097T50, 184×88 px |
+| Display | Pervasive Displays E2154JS0C1, 152×152 px, nero/bianco/rosso |
+| Interfaccia pannello | PDI EXT3/EXT3.1 o circuito boost equivalente per Film J |
 | Deep-sleep wake | GPIO16 collegato a RST |
 
 Pin principali:
@@ -28,6 +34,12 @@ Pin principali:
 | E-paper DC | 15 |
 | E-paper CS / LED blu | 2 |
 
+I GPIO indicano il collegamento logico tra HUZZAH e la scheda di pilotaggio.
+Il pannello nudo a 24 pin richiede il circuito boost indicato dal produttore:
+non deve essere collegato direttamente all'ESP8266 e non è elettricamente
+intercambiabile con il precedente pannello Good Display usando soltanto il
+connettore FPC.
+
 ## Comportamento corrente
 
 - Deep sleep di 300 secondi.
@@ -40,8 +52,13 @@ Pin principali:
   freddo.
 - Modalità manutenzione OTA persistente, comandata da Home Assistant: mantiene
   il dispositivo online e continua i cicli BSEC2 ogni 5 minuti.
-- Aggiornamento e-paper non più frequente di 5 minuti, refresh parziale quando
-  possibile e refresh completo di pulizia ogni 6 cicli.
+- Il pannello Film J supporta il solo refresh globale; il tempo tipico indicato
+  dal produttore è circa 14,5 secondi.
+- Le variazioni del display vengono accorpate per almeno 6 cicli, circa 30
+  minuti. Un refresh globale viene comunque forzato ogni 72 cicli, circa 6 ore,
+  oppure tramite il pulsante Home Assistant **Refresh Display**.
+- Valori numerici neri, icone e accenti rossi; anche IAQ da 100 in su e barra
+  batteria al 20% o meno diventano rossi.
 - Brevissimo lampeggio del LED blu in corrispondenza dell'heartbeat di circa
   30 minuti.
 - Fuel gauge lasciato operativo durante il deep sleep; percentuale filtrata
@@ -79,8 +96,8 @@ CO2 equivalente e VOC equivalente.
         ├── sensor.py
         ├── envirosense_cube.h
         ├── envirosense_cube.cpp
-        ├── GDEW0097T50_lib.h
-        ├── GDEW0097T50_lib.cpp
+        ├── E2154JS0C1_lib.h
+        ├── E2154JS0C1_lib.cpp
         └── icon_*.h
 ```
 
@@ -153,7 +170,10 @@ non devono essere versionati. Il repository contiene soltanto
 
 ## Note di sviluppo
 
-Il driver e-paper è specifico del progetto e usa Adafruit GFX per comporre il
-framebuffer. Le scelte architetturali, la disposizione dello stato RTC e le
-indicazioni per proseguire lo sviluppo sono documentate in
+Il driver e-paper è un port minimale della sequenza globale Film J / driver C
+del progetto ufficiale
+[PDLS_EXT3_Basic_Global](https://github.com/PervasiveDisplays/PDLS_EXT3_Basic_Global),
+distribuito con licenza CC BY-SA 4.0. Adafruit GFX compone due framebuffer da
+1 bit, uno nero e uno rosso. Le scelte architetturali, la disposizione dello
+stato RTC e le indicazioni per proseguire lo sviluppo sono documentate in
 [`CONTEXT_HANDOFF.md`](CONTEXT_HANDOFF.md).

@@ -1,6 +1,6 @@
-# EnviroSenseCube ESPHome — Context Handoff
+# EnviroSenseCube ESPHome E2154JS0C1 — Context Handoff
 
-Stato del progetto al 16 settembre 2026. Questo documento serve a riprendere
+Stato del progetto al 20 settembre 2026. Questo documento serve a riprendere
 lo sviluppo senza ricostruire le decisioni prese durante la migrazione dal
 firmware Arduino a ESPHome.
 
@@ -20,7 +20,8 @@ firmware Arduino originale è un progetto separato e non viene modificato.
 - Bosch BSEC2 Software Library `1.10.2610` (BSEC `2.6.1.0`).
 - Adafruit LC709203F `1.3.4`.
 - Adafruit GFX `1.11.11`.
-- Driver locale Good Display GDEW0097T50.
+- Driver locale Pervasive Displays E2154JS0C1, derivato dalla sequenza Film J
+  / driver C di `PDLS_EXT3_Basic_Global`.
 
 Il componente ESPHome è implementato in `components/envirosense_cube` e viene
 caricato tramite `external_components` con sorgente locale.
@@ -106,10 +107,12 @@ test e recovery sono stati rimossi.
 
 ## Stato RTC
 
-`SupportData` occupa 272 byte e contiene:
+`SupportData` occupa ancora 272 byte e contiene:
 
 - riferimenti dell'ultima pubblicazione;
-- snapshot necessario a ricostruire il precedente framebuffer e-paper;
+- snapshot numerico del precedente contenuto e-paper, conservato per non
+  migrare il layout RTC e rischiare lo stato BSEC2; Film J non lo usa per un
+  refresh parziale;
 - storico compatto della batteria;
 - contatori di display, heartbeat e checkpoint;
 - flag operativi, incluso OTA;
@@ -141,18 +144,29 @@ per non perdere il proprio inseguimento dello stato di carica.
 
 ## Display e-paper
 
-- Risoluzione logica: 184×88 px.
-- Framebuffer composto con `GFXcanvas1`.
-- Icone conservate in header indipendenti.
-- Quattro misure principali: temperatura, umidità, pressione e Static IAQ.
-- Pressione e IAQ sono interi; temperatura e umidità mostrano una cifra
-  decimale.
-- Batteria rappresentata da icona e barra orizzontale in basso.
+- Modello ufficiale: Pervasive Displays `E2154JS0C1` (la `S` iniziale usata
+  nel nome della branch non fa parte del codice prodotto).
+- Film J Spectra Red R2.0, risoluzione 152×152 px, colori nero/bianco/rosso.
+- Due `GFXcanvas1` temporanei da 2.888 byte: piano nero e piano rosso. Vengono
+  allocati soltanto durante il refresh e liberati prima di attivare Wi-Fi/API.
+- Il driver usa il solo refresh globale pubblico previsto da PDI; non tenta
+  refresh parziali o veloci non documentati per Film J.
+- Tempo di refresh tipico dichiarato: circa 14,5 secondi. Timeout firmware: 40
+  secondi, con spegnimento best-effort del DC/DC in caso di errore.
+- Gli aggiornamenti richiesti dalle soglie vengono accorpati per almeno 6
+  cicli, circa 30 minuti. Un refresh viene forzato ogni 72 cicli, circa 6 ore.
+- Il pulsante **Refresh Display** richiede un refresh globale immediato quando
+  il dispositivo è sveglio in modalità manutenzione OTA.
+- Temperatura e umidità mostrano una cifra decimale; pressione e Static IAQ
+  sono interi. Valori neri, icone e accenti rossi.
+- Static IAQ da 100 in su e riempimento batteria al 20% o meno sono rossi.
+- Batteria rappresentata da icona e barra orizzontale sul bordo inferiore.
 - Nessun grafico storico locale.
-- Refresh parziale full-screen quando esiste uno snapshot compatibile.
-- Refresh completo di pulizia ogni 6 cicli, circa 30 minuti, o su richiesta.
-- Timeout complessivo dell'operazione display: 20 secondi.
-- Il pulsante **Refresh Display** forza temporaneamente un refresh completo.
+
+Il pannello nudo richiede il boost e i componenti esterni del circuito di
+riferimento PDI. Il firmware assume una scheda EXT3/EXT3.1 o equivalente e
+riusa i GPIO logici del progetto: BUSY 12, RST 0, DC 15, CS 2, più SPI hardware
+SCK/MOSI. Non collegare direttamente il FPC del pannello all'ESP8266.
 
 GPIO2 è condiviso tra chip-select e LED blu. Il lampeggio heartbeat viene
 eseguito solo dopo la transazione e-paper, quando SPI è inattivo.
@@ -211,11 +225,11 @@ delle entità va valutato prima di questa operazione.
 
 ## Build verificata
 
-Ultima compilazione locale dopo l'eliminazione dei cicli TPH-only:
+Compilazione locale verificata con ESPHome `2025.7.5`:
 
 ```text
-RAM:   41076 / 81920 byte (50.1%)
-Flash: 550139 / 1044464 byte (52.7%)
+RAM:   40900 / 81920 byte (49.9%)
+Flash: 548563 / 1044464 byte (52.5%)
 ```
 
 Comandi di verifica:
