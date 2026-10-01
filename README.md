@@ -70,8 +70,8 @@ Nel blocco `sensor: - platform: envirosense_cube` sono configurati offset e
 soglie di pubblicazione:
 
 ```yaml
-temperature_offset: -2.3
-humidity_offset: 0.0
+temperature_offset: -1.3
+humidity_offset: -1.0
 pressure_offset: 0.0
 temperature_threshold: 0.1
 humidity_threshold: 0.5
@@ -109,7 +109,8 @@ accanto allo YAML anche nel server ESPHome Device Builder.
 1. In Device Builder scegliere **Crea dispositivo → Importa da file** e
    caricare `envirosensecube.yaml`.
 2. Copiare `components/envirosense_cube` in
-   `/config/esphome/components/envirosense_cube` sul server Home Assistant.
+   `/config/esphome/components/envirosense_cube` sul server Home Assistant,
+   e `flash_layout` in `/config/esphome/flash_layout`.
 3. Copiare `secrets.example.yaml` come `secrets.yaml` oppure aggiungere i
    seguenti segreti all'archivio Secrets già presente:
 
@@ -156,9 +157,21 @@ esphome upload envirosensecube.yaml --device 192.168.1.31
 
 - Lo stato BSEC2 viene catturato in RTC a ogni campione gas valido e ripristinato
   dopo il deep sleep.
-- Con accuratezza 3 viene creato automaticamente un checkpoint in flash ogni
-  72 campioni, pari a circa 6 ore.
+- Il primo checkpoint automatico in flash avviene con accuratezza almeno 2;
+  i successivi sono distanziati di 72 cicli, circa 6 ore, e richiedono ancora
+  accuratezza almeno 2.
 - Il pulsante diagnostico **Save BSEC State** forza un checkpoint manuale.
+- Un backup iniziale verificato viene conservato separatamente in LittleFS;
+  **Restore BSEC2 Backup** lo ripristina. **Reset BSEC2 Calibration** invalida
+  lo stato attivo e il checkpoint, senza eliminare il backup.
+- Il layout flash riserva 32 KiB per il backup senza spostare le preferences.
+  La formattazione avviene solo se l'intera area risulta vuota.
+- **Diagnostic Logging** abilita i log INFO da HA; dopo ogni avvio resta spento,
+  lasciando attivi avvisi ed errori.
+- In OTA la sessione BSEC2 resta attiva e i cicli sono allineati a 300 secondi.
+  Anche il deep sleep viene ridotto del tempo impiegato dal ciclo.
+- La pubblicazione attende Home Assistant, non il semplice client dei log;
+  alla riconnessione HA vengono reinviati i valori finiti disponibili.
 - Il contenuto di calibrazione appartiene al dispositivo e non è incluso nel
   repository.
 

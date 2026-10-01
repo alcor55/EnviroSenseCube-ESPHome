@@ -32,9 +32,13 @@ class EnviroSenseCube : public Component {
   void dump_config() override;
   float get_setup_priority() const override;
   void notify_api_client_connected(const std::string &client_info, const std::string &client_address);
+  void notify_api_client_disconnected(const std::string &client_info, const std::string &client_address);
+  void set_diagnostic_logging(bool enabled);
   void set_ota_maintenance(bool enabled);
   void request_display_refresh();
   void save_bsec_state_to_flash();
+  void reset_bsec_state();
+  void restore_bsec_backup();
 
   void set_deep_sleep(deep_sleep::DeepSleepComponent *deep_sleep) { this->deep_sleep_ = deep_sleep; }
   void set_temperature_offset(float value) { this->temperature_offset_ = value; }
@@ -65,6 +69,9 @@ class EnviroSenseCube : public Component {
  protected:
   static constexpr uint32_t RTC_STATE_KEY = 0xEC5CE502;
   static constexpr uint32_t BSEC_FLASH_STATE_KEY = 0xEC5CE503;
+  static constexpr uint32_t BSEC_FLASH_VALID_KEY = 0xEC5CE504;
+  static constexpr uint8_t BSEC_FLASH_STATE_VALID = 0xA5;
+  static constexpr uint8_t BSEC_FLASH_STATE_INVALID = 0x00;
   static constexpr uint8_t BATTERY_HISTORY_VALUES = 8;
   static constexpr uint8_t BATTERY_SAMPLES = 3;
   // Film J only supports a slow global refresh. Coalesce measurement changes
@@ -81,7 +88,7 @@ class EnviroSenseCube : public Component {
     FLAG_PUBLISH_BATTERY_REFERENCE_VALID = 1 << 2,
     FLAG_OTA_MAINTENANCE_REQUESTED = 1 << 3,
     FLAG_BSEC_STATE_VALID = 1 << 4,
-    FLAG_RESERVED_BSEC_SCHEDULE = 1 << 5,
+    FLAG_BSEC_QUALITY_CHECKPOINT_SAVED = 1 << 5,
     FLAG_LAST_STATIC_IAQ_VALID = 1 << 6,
     FLAG_BATTERY_HISTORY_VALID = 1 << 7,
   };
@@ -141,6 +148,9 @@ class EnviroSenseCube : public Component {
   bool migrate_legacy_support_data_();
   void initialize_support_data_();
   void save_support_data_();
+  void ensure_bsec_backup_();
+  bool mount_bsec_filesystem_();
+  bool read_bsec_backup_(uint8_t *state);
   bool initialize_sensors_();
   bool initialize_bsec_();
   bool acquire_bsec_measurement_();
@@ -157,7 +167,10 @@ class EnviroSenseCube : public Component {
   bool battery_threshold_exceeded_() const;
   void store_publish_attempt_reference_();
   void publish_states_();
+  void reset_cycle_measurements_();
   void start_cycle_();
+  void start_continuous_bsec_cycle_();
+  void abort_cycle_();
   void finish_cycle_();
   void enter_sleep_();
 
@@ -199,15 +212,21 @@ class EnviroSenseCube : public Component {
   PersistentLC709203F battery_gauge_;
   ESPPreferenceObject rtc_preference_;
   ESPPreferenceObject bsec_flash_preference_;
+  ESPPreferenceObject bsec_flash_valid_preference_;
   SupportData support_data_{};
 
   RunState run_state_{STARTING};
   uint32_t state_deadline_{0};
+  uint32_t bsec_cycle_started_at_{0};
   uint32_t bsec_measurement_started_at_{0};
   uint32_t api_authenticated_at_{0};
+  uint32_t diagnostic_last_report_at_{0};
+  bool diagnostic_logging_{false};
+  bool bsec_filesystem_mounted_{false};
   bool cold_boot_{false};
   bool sensors_ready_{false};
   bool environment_sensor_ready_{false};
+  bool bsec_session_active_{false};
   bool bsec_measurement_ready_{false};
   bool manual_display_refresh_requested_{false};
   bool api_client_authenticated_{false};

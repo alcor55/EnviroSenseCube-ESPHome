@@ -1,10 +1,26 @@
 # EnviroSenseCube ESPHome E2154JS0C1 — Context Handoff
 
-Stato del progetto al 20 settembre 2026. Questo documento serve a riprendere
+Stato del progetto al 1 ottobre 2026. Questo documento serve a riprendere
 lo sviluppo senza ricostruire le decisioni prese durante la migrazione dal
 firmware Arduino a ESPHome.
 
 ## Obiettivo
+
+Aggiornamento del 1 ottobre: sincronizzata la logica non-display con la branch
+`ESPHome-GDEW0097T50` (commit `26943f8`). Driver, grafica e cadenza di refresh
+tricolore sono invariati. Compilazione verificata con ESPHome 2025.7.5;
+nessun caricamento sul dispositivo eseguito.
+
+- Connessione HA distinta dai client dei log; reinvio dei valori finiti alla
+  riconnessione e gestione della disconnessione.
+- Switch **Diagnostic Logging**, spento a ogni avvio; avvisi/errori conservati.
+- Backup iniziale BSEC2 verificato in LittleFS, non sovrascritto automaticamente;
+  pulsanti **Restore BSEC2 Backup** e **Reset BSEC2 Calibration**.
+- Area LittleFS da 32 KiB con fine a `0x405FB000`: preferences non spostate.
+  Formattazione consentita solo dopo verifica completa dell'area vuota.
+  Copiare anche `flash_layout` sul server Device Builder.
+- Cadenza BSEC2 di 300 secondi: sessione continua in OTA, sonno compensato
+  per il tempo del ciclo. Arrotondamento T/H pubblicate a un decimale.
 
 Il firmware deve comportarsi come un normale dispositivo ESPHome in Home
 Assistant, mantenendo consumi ridotti, letture batteria stabili, uno stato
@@ -81,7 +97,7 @@ Quando OTA è attivo:
 
 - deep sleep viene impedito;
 - Wi-Fi resta abilitato;
-- il ciclo BSEC2 continua ogni 300 secondi;
+- il ciclo BSEC2 continua ogni 300 secondi senza reinizializzare la sessione;
 - lo stato viene comunque aggiornato in RTC.
 
 Quando OTA viene spento, il firmware consente nuovamente il deep sleep.
@@ -94,8 +110,8 @@ Quando OTA viene spento, il firmware consente nuovamente il deep sleep.
   equivalente.
 - Il display usa Static IAQ; Home Assistant espone sia Static sia Adaptive IAQ.
 - Lo stato BSEC viene salvato in RTC a ogni campione valido.
-- Il checkpoint automatico in flash avviene ogni 72 campioni soltanto con
-  accuratezza almeno 3, per limitare l'usura.
+- Il primo checkpoint automatico in flash avviene con accuratezza almeno 2;
+  i successivi sono distanziati di 72 cicli e richiedono accuratezza almeno 2.
 - Il pulsante **Save BSEC State** forza il checkpoint dell'ultimo blob RTC
   valido anche quando l'accuratezza corrente non è disponibile.
 
@@ -119,8 +135,8 @@ test e recovery sono stati rimossi.
 - blob BSEC2.
 
 Esiste una migrazione one-shot dal precedente layout RTC da 320 byte. Il bit 5
-dei flag, usato in passato per alternare BSEC e TPH-only, è ora riservato per
-preservare il layout. Non riordinare o ridimensionare `SupportData` senza
+dei flag indica ora che un checkpoint con accuratezza almeno 2 è stato salvato.
+Non riordinare o ridimensionare `SupportData` senza
 progettare una nuova migrazione e aggiornare lo `static_assert`.
 
 Le chiavi preference correnti sono:
@@ -177,8 +193,8 @@ Offset e soglie sono dichiarati in `envirosensecube.yaml` e validati da
 `sensor.py`. Non sono più costanti hard-coded nel C++:
 
 ```yaml
-temperature_offset: -2.3
-humidity_offset: 0.0
+temperature_offset: -1.3
+humidity_offset: -1.0
 pressure_offset: 0.0
 temperature_threshold: 0.1
 humidity_threshold: 0.5

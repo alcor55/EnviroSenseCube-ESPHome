@@ -1,6 +1,7 @@
 #include "envirosense_cube.h"
 
 #include <SPI.h>
+#include <LittleFS.h>
 #include <Esp.h>
 #include <algorithm>
 #include <cmath>
@@ -12,7 +13,14 @@
 #include "icon_humidity.h"
 #include "icon_pressure.h"
 #include "icon_temperature.h"
+#include "esphome/core/application.h"
+#include "esphome/components/logger/logger.h"
 #include "esphome/core/log.h"
+
+extern "C" {
+extern uint32_t _FS_start;
+extern uint32_t _FS_end;
+}
 
 namespace esphome {
 namespace envirosense_cube {
@@ -36,7 +44,17 @@ static constexpr uint32_t API_CONNECTION_TIMEOUT_MS = 45000;
 static constexpr uint32_t API_READY_DELAY_MS = 2000;
 static constexpr uint32_t API_FLUSH_MS = 10000;
 static constexpr uint32_t BSEC_MEASUREMENT_TIMEOUT_MS = 10000;
-static constexpr uint32_t OTA_MAINTENANCE_CYCLE_INTERVAL_MS = 300000;
+static constexpr uint32_t BSEC_CYCLE_INTERVAL_MS = 300000;
+static constexpr uint32_t OTA_RECOVERY_RETRY_MS = 5000;
+static constexpr uint32_t MINIMUM_DEEP_SLEEP_MS = 1000;
+static constexpr const char *BSEC_BACKUP_PATH = "/bsec2-backup.bin";
+static constexpr const char *BSEC_BACKUP_TEMP_PATH = "/bsec2-backup.tmp";
+struct BsecBackupRecord {
+  uint32_t magic;
+  uint32_t state_hash;
+  uint8_t state[BSEC_MAX_STATE_BLOB_SIZE];
+};
+static constexpr uint32_t BSEC_BACKUP_MAGIC = 0x42534332;
 
 // Layout used by the immediately preceding firmware. It is retained only to
 // migrate the live BSEC2 state after the one-time RTC format change.
@@ -110,6 +128,8 @@ void EnviroSenseCube::setup() {
   this->rtc_preference_ = global_preferences->make_preference<SupportData>(RTC_STATE_KEY, false);
   this->bsec_flash_preference_ =
       global_preferences->make_preference<uint8_t[BSEC_MAX_STATE_BLOB_SIZE]>(BSEC_FLASH_STATE_KEY, true);
+  this->bsec_flash_valid_preference_ =
+      global_preferences->make_preference<uint8_t>(BSEC_FLASH_VALID_KEY, true);
   this->cold_boot_ = !this->rtc_preference_.load(&this->support_data_);
 
   if (this->cold_boot_) {
@@ -122,6 +142,10 @@ void EnviroSenseCube::setup() {
       this->initialize_support_data_();
     }
   }
+  this->ensure_bsec_backup_();
+  ESP_LOGW(TAG, "Boot diagnostic: reset=%s heap=%u max_block=%u fragmentation=%u%%",
+           ESP.getResetReason().c_str(), ESP.getFreeHeap(), ESP.getMaxFreeBlockSize(),
+           ESP.getHeapFragmentation());
 
   if (this->flag_(FLAG_OTA_MAINTENANCE_REQUESTED)) {
     ESP_LOGI(TAG, "Persistent OTA maintenance mode active; keeping WiFi and device awake");
@@ -150,6 +174,13 @@ void EnviroSenseCube::setup() {
 
 void EnviroSenseCube::loop() {
   const uint32_t now = millis();
+  if (this->diagnostic_logging_ && now - this->diagnostic_last_report_at_ >= 30000) {
+    this->diagnostic_last_report_at_ = now;
+    ESP_LOGI(TAG, "Alive: uptime=%lus state=%u OTA=%s HA=%s WiFi=%s heap=%u max_block=%u fragmentation=%u%%",
+             now / 1000, this->run_state_, YESNO(this->flag_(FLAG_OTA_MAINTENANCE_REQUESTED)),
+             YESNO(this->api_client_authenticated_), YESNO(wifi::global_wifi_component->is_connected()),
+             ESP.getFreeHeap(), ESP.getMaxFreeBlockSize(), ESP.getHeapFragmentation());
+  }
   if (this->manual_display_refresh_requested_ &&
       (this->run_state_ == FINISHED || this->run_state_ == WAITING_FOR_NEXT_CYCLE) &&
       std::isfinite(this->temperature_) && std::isfinite(this->humidity_) &&
@@ -176,7 +207,7 @@ void EnviroSenseCube::loop() {
       if (!this->bsec_.run()) {
         ESP_LOGW(TAG, "BSEC2 run failed while waiting: BSEC=%d BME68x=%d", this->bsec_.status,
                  this->bsec_.sensor.status);
-        this->enter_sleep_();
+        this->abort_cycle_();
       } else if (this->bsec_measurement_ready_) {
         ESP_LOGI(TAG, "BSEC2 gas sample ready after %u ms", now - this->bsec_measurement_started_at_);
         this->capture_bsec_state_();
@@ -185,7 +216,7 @@ void EnviroSenseCube::loop() {
       } else if (static_cast<int32_t>(now - this->state_deadline_) >= 0) {
         ESP_LOGW(TAG, "BSEC2 gas measurement timed out after %u ms: BSEC=%d BME68x=%d",
                  BSEC_MEASUREMENT_TIMEOUT_MS, this->bsec_.status, this->bsec_.sensor.status);
-        this->enter_sleep_();
+        this->abort_cycle_();
       }
       break;
 
@@ -204,7 +235,7 @@ void EnviroSenseCube::loop() {
       if (this->api_client_authenticated_ && api::global_api_server != nullptr &&
           api::global_api_server->is_connected()) {
         if (now - this->api_authenticated_at_ >= API_READY_DELAY_MS) {
-          ESP_LOGI(TAG, "API authenticated and settled; publishing all available states");
+          ESP_LOGI(TAG, "Home Assistant authenticated and settled; publishing all available states");
           this->publish_states_();
           this->state_deadline_ = now + API_FLUSH_MS;
           this->run_state_ = WAITING_FOR_API_FLUSH;
@@ -231,8 +262,13 @@ void EnviroSenseCube::loop() {
         ESP_LOGI(TAG, "OTA maintenance disabled; entering normal deep sleep");
         this->enter_sleep_();
       } else if (static_cast<int32_t>(now - this->state_deadline_) >= 0) {
-        ESP_LOGI(TAG, "OTA maintenance interval complete; starting BSEC2/gas cycle");
-        this->start_cycle_();
+        if (this->bsec_session_active_) {
+          ESP_LOGI(TAG, "OTA maintenance interval complete; continuing live BSEC2 session");
+          this->start_continuous_bsec_cycle_();
+        } else {
+          ESP_LOGI(TAG, "OTA maintenance retry interval complete; reinitializing BSEC2 session");
+          this->start_cycle_();
+        }
       }
       break;
 
@@ -243,9 +279,40 @@ void EnviroSenseCube::loop() {
 
 void EnviroSenseCube::notify_api_client_connected(const std::string &client_info,
                                                   const std::string &client_address) {
+  if (client_info.compare(0, 14, "Home Assistant") != 0) {
+    ESP_LOGI(TAG, "API client connected (not HA): '%s' from %s", client_info.c_str(), client_address.c_str());
+    return;
+  }
   this->api_client_authenticated_ = true;
   this->api_authenticated_at_ = millis();
   ESP_LOGI(TAG, "Authenticated API client connected: '%s' from %s", client_info.c_str(), client_address.c_str());
+  // Republish finite states when HA reconnects, even between measurement cycles.
+  if (this->bsec_measurement_ready_)
+    this->set_timeout("ha_republish", API_READY_DELAY_MS, [this]() {
+      if (this->api_client_authenticated_)
+        this->publish_states_();
+    });
+}
+
+void EnviroSenseCube::notify_api_client_disconnected(const std::string &client_info,
+                                                     const std::string &client_address) {
+  if (client_info.compare(0, 14, "Home Assistant") == 0) {
+    this->api_client_authenticated_ = false;
+    this->cancel_timeout("ha_republish");
+    ESP_LOGW(TAG, "Home Assistant API disconnected: %s heap=%u max_block=%u",
+             client_address.c_str(), ESP.getFreeHeap(), ESP.getMaxFreeBlockSize());
+  }
+}
+
+void EnviroSenseCube::set_diagnostic_logging(bool enabled) {
+  this->diagnostic_logging_ = enabled;
+  if (logger::global_logger != nullptr) {
+    const uint8_t level = enabled ? ESPHOME_LOG_LEVEL_INFO : ESPHOME_LOG_LEVEL_WARN;
+    logger::global_logger->set_log_level(level);
+    for (const char *tag : {TAG, "envirosense_epaper", "api", "api.connection", "wifi"})
+      logger::global_logger->set_log_level(tag, level);
+  }
+  ESP_LOGW(TAG, "Diagnostic logging %s", enabled ? "enabled" : "disabled (warnings/errors only)");
 }
 
 void EnviroSenseCube::set_flag_(SupportFlag flag, bool enabled) {
@@ -299,7 +366,9 @@ void EnviroSenseCube::save_bsec_state_to_flash() {
     return;
   }
 
-  if (!this->bsec_flash_preference_.save(&this->support_data_.bsec_state)) {
+  const uint8_t flash_state_valid = BSEC_FLASH_STATE_VALID;
+  if (!this->bsec_flash_preference_.save(&this->support_data_.bsec_state) ||
+      !this->bsec_flash_valid_preference_.save(&flash_state_valid)) {
     ESP_LOGW(TAG, "Manual BSEC2 flash checkpoint failed");
     return;
   }
@@ -309,10 +378,61 @@ void EnviroSenseCube::save_bsec_state_to_flash() {
   }
 
   this->support_data_.bsec_flash_cycles = 0;
+  this->set_flag_(FLAG_BSEC_QUALITY_CHECKPOINT_SAVED,
+                  std::isfinite(this->iaq_accuracy_) && this->iaq_accuracy_ >= 2.0f);
   this->save_support_data_();
   ESP_LOGI(TAG, "Manual BSEC2 flash checkpoint saved: hash=%08lX accuracy=%.0f",
            static_cast<unsigned long>(bsec_state_hash(this->support_data_.bsec_state)),
            this->iaq_accuracy_);
+}
+
+void EnviroSenseCube::reset_bsec_state() {
+  ESP_LOGW(TAG, "Manual BSEC2 calibration reset requested");
+
+  const uint8_t flash_state_valid = BSEC_FLASH_STATE_INVALID;
+  if (!this->bsec_flash_valid_preference_.save(&flash_state_valid) ||
+      !global_preferences->sync()) {
+    ESP_LOGE(TAG, "BSEC2 calibration reset aborted: flash invalidation failed");
+    return;
+  }
+
+  memset(this->support_data_.bsec_state, 0, sizeof(this->support_data_.bsec_state));
+  this->set_flag_(FLAG_BSEC_STATE_VALID, false);
+  this->set_flag_(FLAG_BSEC_QUALITY_CHECKPOINT_SAVED, false);
+  this->support_data_.bsec_flash_cycles = BSEC_FLASH_NOT_SAVED;
+  this->iaq_accuracy_ = NAN;
+  this->bsec_stabilized_ = false;
+  this->bsec_run_in_complete_ = false;
+  this->save_support_data_();
+
+  ESP_LOGW(TAG,
+           "BSEC2 calibration reset complete: RTC state cleared, flash checkpoint invalidated; rebooting");
+  App.safe_reboot();
+}
+
+void EnviroSenseCube::restore_bsec_backup() {
+  uint8_t backup_state[BSEC_MAX_STATE_BLOB_SIZE];
+  if (!this->read_bsec_backup_(backup_state)) {
+    ESP_LOGE(TAG, "BSEC2 backup restore rejected: no valid backup is available");
+    return;
+  }
+
+  const uint8_t flash_state_valid = BSEC_FLASH_STATE_VALID;
+  if (!this->bsec_flash_preference_.save(&backup_state) ||
+      !this->bsec_flash_valid_preference_.save(&flash_state_valid) ||
+      !global_preferences->sync()) {
+    ESP_LOGE(TAG, "BSEC2 backup restore aborted: flash checkpoint write failed");
+    return;
+  }
+
+  memcpy(this->support_data_.bsec_state, backup_state, sizeof(backup_state));
+  this->set_flag_(FLAG_BSEC_STATE_VALID, true);
+  this->set_flag_(FLAG_BSEC_QUALITY_CHECKPOINT_SAVED, false);
+  this->support_data_.bsec_flash_cycles = 0;
+  this->save_support_data_();
+  ESP_LOGW(TAG, "BSEC2 backup restored: hash=%08lX; rebooting",
+           static_cast<unsigned long>(bsec_state_hash(backup_state)));
+  App.safe_reboot();
 }
 
 void EnviroSenseCube::dump_config() {
@@ -320,7 +440,10 @@ void EnviroSenseCube::dump_config() {
                 "EnviroSenseCube:\n"
                 "  Sampling/deep sleep: 300 seconds\n"
                 "  BSEC2 static/adaptive IAQ: ULP every cycle (5 minutes)\n"
-                "  BSEC2 state: every gas cycle in RTC; calibrated checkpoint every 6 hours in flash\n"
+                "  OTA maintenance: one continuous BSEC2 session across cycles\n"
+                "  BSEC2 cadence: 300 seconds measured from cycle start\n"
+                "  BSEC2 state: RTC each cycle; flash at accuracy >=2, then every 6 hours\n"
+                "  BSEC2 safety backup: verified LittleFS file, captured once\n"
                 "  Emergency OTA/API window after cold boot: 20 seconds\n"
                 "  OTA-maintenance sensor start delay: none\n"
                 "  Diagnostic stay-awake mode: disabled\n"
@@ -394,8 +517,97 @@ void EnviroSenseCube::save_support_data_() {
     ESP_LOGW(TAG, "Unable to save state in RTC memory");
 }
 
+bool EnviroSenseCube::mount_bsec_filesystem_() {
+  if (this->bsec_filesystem_mounted_)
+    return true;
+  LittleFSConfig config;
+  config.setAutoFormat(false);
+  LittleFS.setConfig(config);
+  this->bsec_filesystem_mounted_ = LittleFS.begin();
+  if (!this->bsec_filesystem_mounted_) {
+    // Format only the explicitly reserved area, and only when every byte is erased.
+    const uint32_t start = reinterpret_cast<uintptr_t>(&_FS_start) - 0x40200000;
+    const uint32_t end = reinterpret_cast<uintptr_t>(&_FS_end) - 0x40200000;
+    bool blank = end > start && end - start == 32768;
+    uint32_t words[64];
+    for (uint32_t address = start; blank && address < end; address += sizeof(words)) {
+      if (!ESP.flashRead(address, words, sizeof(words))) {
+        blank = false;
+        break;
+      }
+      for (uint32_t word : words)
+        if (word != 0xFFFFFFFFUL) {
+          blank = false;
+          break;
+        }
+      yield();
+    }
+    if (blank) {
+      ESP_LOGW(TAG, "Initializing verified-empty 32 KiB BSEC2 backup filesystem");
+      this->bsec_filesystem_mounted_ = LittleFS.format() && LittleFS.begin();
+    }
+    if (!this->bsec_filesystem_mounted_)
+      ESP_LOGE(TAG, "BSEC2 backup filesystem unavailable; existing data will not be formatted");
+  }
+  return this->bsec_filesystem_mounted_;
+}
+
+bool EnviroSenseCube::read_bsec_backup_(uint8_t *state) {
+  if (!this->mount_bsec_filesystem_())
+    return false;
+  auto file = LittleFS.open(BSEC_BACKUP_PATH, "r");
+  BsecBackupRecord record{};
+  if (!file || file.size() != sizeof(record) ||
+      file.read(reinterpret_cast<uint8_t *>(&record), sizeof(record)) != sizeof(record))
+    return false;
+  file.close();
+  if (record.magic != BSEC_BACKUP_MAGIC || record.state_hash != bsec_state_hash(record.state))
+    return false;
+  memcpy(state, record.state, BSEC_MAX_STATE_BLOB_SIZE);
+  return true;
+}
+
+void EnviroSenseCube::ensure_bsec_backup_() {
+  if (!this->mount_bsec_filesystem_())
+    return;
+  uint8_t existing_state[BSEC_MAX_STATE_BLOB_SIZE];
+  if (LittleFS.exists(BSEC_BACKUP_PATH)) {
+    if (this->read_bsec_backup_(existing_state))
+      ESP_LOGI(TAG, "BSEC2 safety backup verified: hash=%08lX",
+               static_cast<unsigned long>(bsec_state_hash(existing_state)));
+    else
+      ESP_LOGE(TAG, "Existing BSEC2 backup is invalid; preserved for recovery");
+    return;
+  }
+  if (!this->flag_(FLAG_BSEC_STATE_VALID)) {
+    ESP_LOGW(TAG, "BSEC2 safety backup deferred: no valid RTC state is available");
+    return;
+  }
+
+  BsecBackupRecord record{};
+  record.magic = BSEC_BACKUP_MAGIC;
+  memcpy(record.state, this->support_data_.bsec_state, sizeof(record.state));
+  record.state_hash = bsec_state_hash(record.state);
+  auto file = LittleFS.open(BSEC_BACKUP_TEMP_PATH, "w");
+  if (!file) {
+    ESP_LOGE(TAG, "Unable to create BSEC2 safety backup");
+    return;
+  }
+  const size_t written = file.write(reinterpret_cast<const uint8_t *>(&record), sizeof(record));
+  file.flush();
+  file.close();
+  if (written != sizeof(record) || !LittleFS.rename(BSEC_BACKUP_TEMP_PATH, BSEC_BACKUP_PATH) ||
+      !this->read_bsec_backup_(existing_state)) {
+    ESP_LOGE(TAG, "BSEC2 safety backup write/verification failed");
+    return;
+  }
+  ESP_LOGW(TAG, "BSEC2 safety backup created and verified: hash=%08lX",
+           static_cast<unsigned long>(record.state_hash));
+}
+
 bool EnviroSenseCube::initialize_sensors_() {
   this->environment_sensor_ready_ = this->initialize_bsec_();
+  this->bsec_session_active_ = this->environment_sensor_ready_;
   if (!this->environment_sensor_ready_)
     ESP_LOGE(TAG, "BME688 initialization failed");
 
@@ -480,11 +692,21 @@ bool EnviroSenseCube::restore_bsec_state_() {
     this->set_flag_(FLAG_BSEC_STATE_VALID, false);
   }
 
+  uint8_t flash_state_valid = BSEC_FLASH_STATE_VALID;
+  const bool has_flash_valid_marker = this->bsec_flash_valid_preference_.load(&flash_state_valid);
+  const bool flash_checkpoint_enabled =
+      !has_flash_valid_marker || flash_state_valid == BSEC_FLASH_STATE_VALID;
+  if (!flash_checkpoint_enabled) {
+    ESP_LOGI(TAG, "BSEC2 flash checkpoint is explicitly invalidated");
+  }
+
   uint8_t flash_state[BSEC_MAX_STATE_BLOB_SIZE];
-  if (this->bsec_flash_preference_.load(&flash_state) && this->bsec_.setState(flash_state)) {
+  if (flash_checkpoint_enabled && this->bsec_flash_preference_.load(&flash_state) &&
+      this->bsec_.setState(flash_state)) {
     memcpy(this->support_data_.bsec_state, flash_state, sizeof(flash_state));
     this->set_flag_(FLAG_BSEC_STATE_VALID, true);
     this->support_data_.bsec_flash_cycles = 0;
+    this->ensure_bsec_backup_();
     ESP_LOGI(TAG, "BSEC2 state restored from flash checkpoint");
     return true;
   }
@@ -523,20 +745,25 @@ void EnviroSenseCube::checkpoint_bsec_state_() {
     this->support_data_.bsec_flash_cycles++;
 
   const bool checkpoint_due =
+      !this->flag_(FLAG_BSEC_QUALITY_CHECKPOINT_SAVED) ||
       this->support_data_.bsec_flash_cycles == BSEC_FLASH_NOT_SAVED ||
       this->support_data_.bsec_flash_cycles >= BSEC_FLASH_CHECKPOINT_CYCLES;
-  if (!checkpoint_due || !std::isfinite(this->iaq_accuracy_) || this->iaq_accuracy_ < 3.0f)
+  if (!checkpoint_due || !std::isfinite(this->iaq_accuracy_) || this->iaq_accuracy_ < 2.0f)
     return;
 
-  if (this->bsec_flash_preference_.save(&this->support_data_.bsec_state) && global_preferences->sync()) {
+  const uint8_t flash_state_valid = BSEC_FLASH_STATE_VALID;
+  if (this->bsec_flash_preference_.save(&this->support_data_.bsec_state) &&
+      this->bsec_flash_valid_preference_.save(&flash_state_valid) && global_preferences->sync()) {
     this->support_data_.bsec_flash_cycles = 0;
-    ESP_LOGI(TAG, "Calibrated BSEC2 state checkpointed to flash");
+    this->set_flag_(FLAG_BSEC_QUALITY_CHECKPOINT_SAVED, true);
+    ESP_LOGW(TAG, "BSEC2 state checkpointed to flash: accuracy=%.0f hash=%08lX",
+             this->iaq_accuracy_, static_cast<unsigned long>(bsec_state_hash(this->support_data_.bsec_state)));
   } else {
     ESP_LOGW(TAG, "Unable to checkpoint BSEC2 state to flash");
   }
 }
 
-void EnviroSenseCube::start_cycle_() {
+void EnviroSenseCube::reset_cycle_measurements_() {
   this->temperature_ = NAN;
   this->humidity_ = NAN;
   this->pressure_ = NAN;
@@ -549,18 +776,23 @@ void EnviroSenseCube::start_cycle_() {
   this->bsec_stabilized_ = false;
   this->bsec_run_in_complete_ = false;
   this->bsec_measurement_ready_ = false;
+}
+
+void EnviroSenseCube::start_cycle_() {
+  this->reset_cycle_measurements_();
   this->sensors_ready_ = this->initialize_sensors_();
   ESP_LOGI(TAG, "Sensor initialization complete: %s", this->sensors_ready_ ? "ready" : "failed");
   if (!this->sensors_ready_) {
     ESP_LOGW(TAG, "Cycle aborted; retrying after normal deep sleep");
-    this->enter_sleep_();
+    this->abort_cycle_();
     return;
   }
 
   this->read_battery_();
+  this->bsec_cycle_started_at_ = millis();
   if (!this->acquire_bsec_measurement_()) {
     ESP_LOGW(TAG, "Cycle aborted; retrying after normal deep sleep");
-    this->enter_sleep_();
+    this->abort_cycle_();
     return;
   }
   if (!this->bsec_measurement_ready_) {
@@ -575,10 +807,44 @@ void EnviroSenseCube::start_cycle_() {
   this->complete_measurement_cycle_();
 }
 
+void EnviroSenseCube::start_continuous_bsec_cycle_() {
+  this->reset_cycle_measurements_();
+  this->read_battery_();
+  this->bsec_cycle_started_at_ = millis();
+  if (!this->acquire_bsec_measurement_()) {
+    ESP_LOGW(TAG, "Continuous BSEC2 cycle failed; scheduling a clean session reinitialization");
+    this->abort_cycle_();
+    return;
+  }
+  if (!this->bsec_measurement_ready_) {
+    this->bsec_measurement_started_at_ = millis();
+    this->state_deadline_ = this->bsec_measurement_started_at_ + BSEC_MEASUREMENT_TIMEOUT_MS;
+    this->run_state_ = WAITING_FOR_BSEC;
+    ESP_LOGI(TAG, "Continuous BSEC2 measurement started; waiting up to %u ms for gas data",
+             BSEC_MEASUREMENT_TIMEOUT_MS);
+    return;
+  }
+
+  this->complete_measurement_cycle_();
+}
+
+void EnviroSenseCube::abort_cycle_() {
+  this->bsec_session_active_ = false;
+  if (this->flag_(FLAG_OTA_MAINTENANCE_REQUESTED)) {
+    this->save_support_data_();
+    this->state_deadline_ = millis() + OTA_RECOVERY_RETRY_MS;
+    this->run_state_ = WAITING_FOR_NEXT_CYCLE;
+    ESP_LOGW(TAG, "OTA maintenance active; BSEC2 reinitialization scheduled in %u seconds",
+             OTA_RECOVERY_RETRY_MS / 1000);
+    return;
+  }
+  this->enter_sleep_();
+}
+
 void EnviroSenseCube::complete_measurement_cycle_() {
   if (!this->validate_measurements_()) {
     ESP_LOGW(TAG, "Cycle aborted; retrying after normal deep sleep");
-    this->enter_sleep_();
+    this->abort_cycle_();
     return;
   }
 
@@ -905,10 +1171,15 @@ void EnviroSenseCube::finish_cycle_() {
       this->support_data_.display_update_count++;
     this->save_support_data_();
     this->cold_boot_ = false;
-    this->state_deadline_ = millis() + OTA_MAINTENANCE_CYCLE_INTERVAL_MS;
+    this->state_deadline_ = this->bsec_cycle_started_at_ + BSEC_CYCLE_INTERVAL_MS;
     this->run_state_ = WAITING_FOR_NEXT_CYCLE;
-    ESP_LOGI(TAG, "OTA maintenance active; state saved and next cycle scheduled in %u seconds",
-             OTA_MAINTENANCE_CYCLE_INTERVAL_MS / 1000);
+    const uint32_t now = millis();
+    const uint32_t remaining_ms = static_cast<int32_t>(this->state_deadline_ - now) > 0
+                                      ? this->state_deadline_ - now
+                                      : 0;
+    ESP_LOGI(TAG,
+             "OTA maintenance active; live BSEC2 state saved and next cycle aligned in %u seconds",
+             remaining_ms / 1000);
     return;
   }
   this->enter_sleep_();
@@ -922,10 +1193,17 @@ void EnviroSenseCube::enter_sleep_() {
   if (this->support_data_.display_update_count < DISPLAY_FULL_REFRESH_CYCLES)
     this->support_data_.display_update_count++;
   this->save_support_data_();
-  ESP_LOGI(TAG, "State saved; requesting clean deep sleep");
+  const uint32_t active_ms = millis() - this->bsec_cycle_started_at_;
+  const uint32_t sleep_ms = active_ms < BSEC_CYCLE_INTERVAL_MS
+                                ? BSEC_CYCLE_INTERVAL_MS - active_ms
+                                : MINIMUM_DEEP_SLEEP_MS;
+  ESP_LOGI(TAG, "State saved; requesting %u-second deep sleep to preserve the 300-second BSEC2 cadence",
+           sleep_ms / 1000);
   this->run_state_ = FINISHED;
-  if (this->deep_sleep_ != nullptr)
+  if (this->deep_sleep_ != nullptr) {
+    this->deep_sleep_->set_sleep_duration(sleep_ms);
     this->deep_sleep_->begin_sleep();
+  }
 }
 
 void EnviroSenseCube::draw_decimal_value_(GFXcanvas1 &black_canvas, GFXcanvas1 &red_canvas,
