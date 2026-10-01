@@ -2,6 +2,10 @@ esphome:
   name: envirosensecube
   friendly_name: EnviroSenseCube
   comment: Battery-powered BME688 environmental monitor
+  includes:
+    - flash_layout
+  platformio_options:
+    board_build.ldscript: src/flash_layout/eagle.flash.4m-bsec.ld
 
 esp8266:
   board: huzzah
@@ -17,14 +21,15 @@ external_components:
 
 logger:
   level: INFO
+  initial_level: WARN
   baud_rate: 115200
   logs:
     wifi: WARN
     api: WARN
     api.connection: WARN
     api.service: WARN
-    envirosense_cube: INFO
-    envirosense_epaper: INFO
+    envirosense_cube: WARN
+    envirosense_epaper: WARN
 
 api:
   reboot_timeout: 0s
@@ -34,6 +39,10 @@ api:
     then:
       - lambda: |-
           id(envirosensecube_core).notify_api_client_connected(client_info, client_address);
+  on_client_disconnected:
+    then:
+      - lambda: |-
+          id(envirosensecube_core).notify_api_client_disconnected(client_info, client_address);
 
 ota:
   - platform: esphome
@@ -73,6 +82,17 @@ binary_sensor:
 
 switch:
   - platform: template
+    id: diagnostic_logging
+    name: Diagnostic Logging
+    icon: mdi:text-box-search-outline
+    entity_category: diagnostic
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    turn_on_action:
+      - lambda: id(envirosensecube_core).set_diagnostic_logging(true);
+    turn_off_action:
+      - lambda: id(envirosensecube_core).set_diagnostic_logging(false);
+  - platform: template
     id: ota_maintenance_control
     name: OTA Maintenance Mode
     icon: mdi:update
@@ -104,6 +124,24 @@ button:
         - lambda: |-
             id(envirosensecube_core).request_display_refresh();
   - platform: template
+    id: reset_bsec_calibration
+    name: Reset BSEC2 Calibration
+    icon: mdi:delete-alert
+    entity_category: diagnostic
+    on_press:
+      then:
+        - lambda: |-
+            id(envirosensecube_core).reset_bsec_state();
+  - platform: template
+    id: restore_bsec_backup
+    name: Restore BSEC2 Backup
+    icon: mdi:backup-restore
+    entity_category: diagnostic
+    on_press:
+      then:
+        - lambda: |-
+            id(envirosensecube_core).restore_bsec_backup();
+  - platform: template
     id: save_bsec_state
     name: Save BSEC State
     icon: mdi:content-save
@@ -117,8 +155,8 @@ sensor:
   - platform: envirosense_cube
     id: envirosensecube_core
     deep_sleep_id: deep_sleep_control
-    temperature_offset: -2.3
-    humidity_offset: 0.0
+    temperature_offset: -1.3
+    humidity_offset: -1.0
     pressure_offset: 0.0
     temperature_threshold: 0.1
     humidity_threshold: 0.5
@@ -127,8 +165,14 @@ sensor:
     battery_threshold: 5.0
     temperature:
       name: Temperature
+      accuracy_decimals: 1
+      filters:
+        - round: 1
     humidity:
       name: Humidity
+      accuracy_decimals: 1
+      filters:
+        - round: 1
     pressure:
       name: Pressure
     gas_resistance:
