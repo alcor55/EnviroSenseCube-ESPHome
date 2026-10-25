@@ -12,6 +12,19 @@ Questa implementazione usa la Native API di ESPHome: Home Assistant crea
 direttamente le entità del dispositivo, senza webhook, MQTT, `input_text` o
 sensori template.
 
+## Correzione BSEC2 del 25 ottobre 2026
+
+Il tempo BSEC2 ora include il deep sleep tramite un riferimento a 64 bit in
+RTC, associato all'hash della calibrazione. Il risveglio segue `next_call` di
+Bosch. Il formato dei salvataggi esistenti e i driver del display non cambiano.
+La prima osservazione a OTA spento sul dispositivo bianco/nero è positiva;
+la stabilità a lungo termine e sul tricolore deve ancora essere verificata.
+
+Il wrapper BSD locale è documentato in
+[`BSEC_WRAPPER_NOTICE.md`](components/envirosense_cube/BSEC_WRAPPER_NOTICE.md).
+Test dell'orologio: `clang++ -std=c++11 -I. tests/bsec_clock_test.cpp -o /tmp/bsec-clock-test`
+e poi `/tmp/bsec-clock-test`.
+
 ## Hardware
 
 | Componente | Configurazione |

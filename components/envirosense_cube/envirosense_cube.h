@@ -3,7 +3,8 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_LC709203F.h>
 #include <Wire.h>
-#include <bsec2.h>
+#include "sleep_aware_bsec2.h"
+#include "bsec_clock.h"
 
 #include "esphome/components/api/api_server.h"
 #include "esphome/components/binary_sensor/binary_sensor.h"
@@ -70,6 +71,7 @@ class EnviroSenseCube : public Component {
   static constexpr uint32_t RTC_STATE_KEY = 0xEC5CE502;
   static constexpr uint32_t BSEC_FLASH_STATE_KEY = 0xEC5CE503;
   static constexpr uint32_t BSEC_FLASH_VALID_KEY = 0xEC5CE504;
+  static constexpr uint32_t BSEC_CLOCK_RTC_KEY = 0xEC5CE505;
   static constexpr uint8_t BSEC_FLASH_STATE_VALID = 0xA5;
   static constexpr uint8_t BSEC_FLASH_STATE_INVALID = 0x00;
   static constexpr uint8_t BATTERY_HISTORY_VALUES = 8;
@@ -148,6 +150,7 @@ class EnviroSenseCube : public Component {
   bool migrate_legacy_support_data_();
   void initialize_support_data_();
   void save_support_data_();
+  bool save_bsec_clock_(uint32_t planned_sleep_ms = 0);
   void ensure_bsec_backup_();
   bool mount_bsec_filesystem_();
   bool read_bsec_backup_(uint8_t *state);
@@ -160,7 +163,7 @@ class EnviroSenseCube : public Component {
   bool restore_bsec_state_();
   void capture_bsec_state_();
   void checkpoint_bsec_state_();
-  static void bsec_data_callback_(const bme68xData data, const bsecOutputs outputs, Bsec2 bsec);
+  static void bsec_data_callback_(const bme68xData data, const bsecOutputs outputs, SleepAwareBsec2 bsec);
   void handle_bsec_data_(const bme68xData &data, const bsecOutputs &outputs);
   void update_last_static_iaq_();
   bool environment_threshold_exceeded_() const;
@@ -208,11 +211,15 @@ class EnviroSenseCube : public Component {
   binary_sensor::BinarySensor *ota_maintenance_sensor_{nullptr};
 
   static EnviroSenseCube *active_bsec_instance_;
-  Bsec2 bsec_;
+  SleepAwareBsec2 bsec_;
   PersistentLC709203F battery_gauge_;
   ESPPreferenceObject rtc_preference_;
   ESPPreferenceObject bsec_flash_preference_;
   ESPPreferenceObject bsec_flash_valid_preference_;
+  ESPPreferenceObject bsec_clock_preference_;
+  uint64_t bsec_clock_offset_ms_{0};
+  bool bsec_clock_ready_{false};
+  bool bsec_clock_failed_{false};
   SupportData support_data_{};
 
   RunState run_state_{STARTING};

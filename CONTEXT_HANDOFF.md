@@ -1,6 +1,34 @@
 # EnviroSenseCube ESPHome E2154JS0C1 — Context Handoff
 
-Stato del progetto al 1 ottobre 2026. Questo documento serve a riprendere
+## Continuità temporale BSEC2 — 25 ottobre 2026
+
+La sessione continua in OTA recupera accuracy 3 e run-in completato; l'utente
+osserva invece Static IAQ 0 e accuracy 0 per giorni in modalità deep sleep.
+Non è ancora dimostrata la causa esclusiva. Nessun reset di calibrazione.
+
+La correzione aggiunge un riferimento temporale a 64 bit in un record
+RTC separato da 24 byte (chiave `0xEC5CE505`), associato all'hash del blob BSEC2.
+`SupportData` resta a 272 byte, e gli offset delle preferences esistenti non
+cambiano. Il sonno programmato viene contato solo su reset da deep sleep;
+su perdita di alimentazione o fallback flash si parte con un nuovo riferimento
+temporale, conservando il blob di calibrazione. Il sonno segue `next_call`
+della libreria anziché soltanto un intervallo esterno.
+
+La copia BSD locale del solo wrapper Bosch (`sleep_aware_bsec2.*`) aggiunge
+l'offset temporale e l'accesso a `next_call`. Algoritmo BSEC binario, profilo
+ULP, formato dello stato e driver BME68x restano invariati. Vedere
+`components/envirosense_cube/BSEC_WRAPPER_NOTICE.md`.
+
+Test host dell'orologio passati e compilazione ESPHome 2025.7.5 riuscita.
+Prima osservazione sul dispositivo bianco/nero positiva: tra le 20:25 e le
+20:56 del 25 ottobre, OTA risulta spento, accuracy resta 3 e run-in completato,
+mentre IAQ statico passa da 175 a 144 e adattivo da 74 a 68. Gli screenshot
+confermano nuove letture, non il numero esatto di deep sleep effettuati.
+Consolidamento e trasferimento alla tricolore richiesti dall'utente; resta
+necessaria l'osservazione prolungata e la verifica sul dispositivo tricolore.
+Nessun caricamento firmware automatico.
+
+Stato del progetto al 25 ottobre 2026. Questo documento serve a riprendere
 lo sviluppo senza ricostruire le decisioni prese durante la migrazione dal
 firmware Arduino a ESPHome.
 
