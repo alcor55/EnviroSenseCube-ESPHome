@@ -143,6 +143,20 @@ void EnviroSenseCube::setup() {
       this->initialize_support_data_();
     }
   }
+  // Allocate after the existing records: their offsets and calibration remain unchanged.
+  this->bsec_clock_preference_ =
+      global_preferences->make_preference<BsecClockState>(BSEC_CLOCK_RTC_KEY, false);
+  BsecClockState clock{};
+  const bool deep_sleep_wake = ESP.getResetInfoPtr()->reason == REASON_DEEP_SLEEP_AWAKE;
+  const bool matching_clock = !this->cold_boot_ && this->flag_(FLAG_BSEC_STATE_VALID) &&
+      this->bsec_clock_preference_.load(&clock) &&
+      bsec_clock_matches(clock, bsec_state_hash(this->support_data_.bsec_state));
+  if (matching_clock)
+    this->bsec_clock_offset_ms_ = bsec_clock_resume(clock, deep_sleep_wake);
+  this->bsec_clock_ready_ = true;
+  ESP_LOGW(TAG, "BSEC2 clock: %s base=%llums deep_sleep_wake=%s; calibration unchanged",
+           matching_clock ? "restored from RTC" : "new time reference",
+           static_cast<unsigned long long>(this->bsec_clock_offset_ms_), YESNO(deep_sleep_wake));
   this->ensure_bsec_backup_();
   ESP_LOGW(TAG, "Boot diagnostic: reset=%s heap=%u max_block=%u fragmentation=%u%%",
            ESP.getResetReason().c_str(), ESP.getFreeHeap(), ESP.getMaxFreeBlockSize(),
@@ -259,7 +273,7 @@ void EnviroSenseCube::loop() {
       break;
 
     case WAITING_FOR_NEXT_CYCLE:
-      if (!this->flag_(FLAG_OTA_MAINTENANCE_REQUESTED)) {
+      if (!this->flag_(FLAG_OTA_MAINTENANCE_REQUESTED) && !this->bsec_clock_failed_) {
         ESP_LOGI(TAG, "OTA maintenance disabled; entering normal deep sleep");
         this->enter_sleep_();
       } else if (static_cast<int32_t>(now - this->state_deadline_) >= 0) {
@@ -513,8 +527,33 @@ bool EnviroSenseCube::migrate_legacy_support_data_() {
 }
 
 void EnviroSenseCube::save_support_data_() {
-  if (!this->rtc_preference_.save(&this->support_data_))
+  if (!this->rtc_preference_.save(&this->support_data_)) {
     ESP_LOGW(TAG, "Unable to save state in RTC memory");
+    return;
+  }
+  if (this->bsec_clock_ready_)
+    this->save_bsec_clock_();
+}
+
+bool EnviroSenseCube::save_bsec_clock_(uint32_t planned_sleep_ms) {
+  BsecClockState clock{};
+  clock.elapsed_ms = this->bsec_session_active_
+                         ? static_cast<uint64_t>(this->bsec_.getTimeMs())
+                         : this->bsec_clock_offset_ms_ + millis();
+  clock.planned_sleep_ms = planned_sleep_ms;
+  clock.state_hash = bsec_state_hash(this->support_data_.bsec_state);
+  clock.version = BSEC_CLOCK_VERSION;
+  if (!this->bsec_clock_preference_.save(&clock)) {
+    this->bsec_clock_failed_ = true;
+    ESP_LOGW(TAG, "Unable to save BSEC2 clock in RTC; deep sleep is unsafe");
+    return false;
+  }
+  this->bsec_clock_failed_ = false;
+  ESP_LOGI(TAG, "BSEC2 clock saved: now=%llums sleep=%ums next_boot_base=%llums hash=%08lX",
+           static_cast<unsigned long long>(clock.elapsed_ms), planned_sleep_ms,
+           static_cast<unsigned long long>(clock.elapsed_ms + planned_sleep_ms),
+           static_cast<unsigned long>(clock.state_hash));
+  return true;
 }
 
 bool EnviroSenseCube::mount_bsec_filesystem_() {
@@ -630,6 +669,7 @@ bool EnviroSenseCube::initialize_sensors_() {
 
 bool EnviroSenseCube::initialize_bsec_() {
   active_bsec_instance_ = this;
+  this->bsec_.setClockOffsetMs(this->bsec_clock_offset_ms_);
   ESP_LOGI(TAG, "Starting BSEC2/BME688 initialization; free heap: %u bytes", ESP.getFreeHeap());
   if (!this->bsec_.begin(0x77, Wire)) {
     ESP_LOGE(TAG, "BSEC2/BME688 begin failed: BSEC=%d BME68x=%d", this->bsec_.status,
@@ -703,6 +743,9 @@ bool EnviroSenseCube::restore_bsec_state_() {
   uint8_t flash_state[BSEC_MAX_STATE_BLOB_SIZE];
   if (flash_checkpoint_enabled && this->bsec_flash_preference_.load(&flash_state) &&
       this->bsec_.setState(flash_state)) {
+    // The flash checkpoint has no RTC timestamp. Never pair it with a stale clock.
+    this->bsec_clock_offset_ms_ = 0;
+    this->bsec_.setClockOffsetMs(0);
     memcpy(this->support_data_.bsec_state, flash_state, sizeof(flash_state));
     this->set_flag_(FLAG_BSEC_STATE_VALID, true);
     this->support_data_.bsec_flash_cycles = 0;
@@ -712,6 +755,8 @@ bool EnviroSenseCube::restore_bsec_state_() {
   }
 
   ESP_LOGI(TAG, "BSEC2 starts without a saved calibration state");
+  this->bsec_clock_offset_ms_ = 0;
+  this->bsec_.setClockOffsetMs(0);
   return false;
 }
 
@@ -938,7 +983,7 @@ bool EnviroSenseCube::acquire_bsec_measurement_() {
   return true;
 }
 
-void EnviroSenseCube::bsec_data_callback_(const bme68xData data, const bsecOutputs outputs, Bsec2 bsec) {
+void EnviroSenseCube::bsec_data_callback_(const bme68xData data, const bsecOutputs outputs, SleepAwareBsec2 bsec) {
   (void) bsec;
   if (active_bsec_instance_ != nullptr)
     active_bsec_instance_->handle_bsec_data_(data, outputs);
@@ -989,8 +1034,9 @@ void EnviroSenseCube::handle_bsec_data_(const bme68xData &data, const bsecOutput
                                   std::isfinite(this->adaptive_iaq_) &&
                                   std::isfinite(this->gas_resistance_);
   ESP_LOGI(TAG,
-           "BSEC2 outputs: count=%u adaptive_accuracy=%d static_accuracy=%d stabilized=%s run_in=%s "
+           "BSEC2 outputs: time=%llums count=%u adaptive_accuracy=%d static_accuracy=%d stabilized=%s run_in=%s "
            "status=%d",
+           static_cast<unsigned long long>(outputs.output[0].time_stamp / INT64_C(1000000)),
            outputs.nOutputs, adaptive_accuracy, static_accuracy, YESNO(this->bsec_stabilized_),
            YESNO(this->bsec_run_in_complete_), this->bsec_.status);
 }
@@ -1194,9 +1240,21 @@ void EnviroSenseCube::enter_sleep_() {
     this->support_data_.display_update_count++;
   this->save_support_data_();
   const uint32_t active_ms = millis() - this->bsec_cycle_started_at_;
-  const uint32_t sleep_ms = active_ms < BSEC_CYCLE_INTERVAL_MS
-                                ? BSEC_CYCLE_INTERVAL_MS - active_ms
-                                : MINIMUM_DEEP_SLEEP_MS;
+  uint32_t sleep_ms = active_ms < BSEC_CYCLE_INTERVAL_MS
+                          ? BSEC_CYCLE_INTERVAL_MS - active_ms
+                          : MINIMUM_DEEP_SLEEP_MS;
+  if (this->bsec_session_active_) {
+    const int64_t until_next_call = this->bsec_.nextCallMs() - this->bsec_.getTimeMs();
+    sleep_ms = until_next_call > 0
+                   ? static_cast<uint32_t>(std::min<int64_t>(until_next_call, BSEC_CYCLE_INTERVAL_MS))
+                   : MINIMUM_DEEP_SLEEP_MS;
+  }
+  if (!this->save_bsec_clock_(sleep_ms)) {
+    // Do not knowingly lose the clock. Keep the session alive until the next cycle.
+    this->state_deadline_ = millis() + sleep_ms;
+    this->run_state_ = WAITING_FOR_NEXT_CYCLE;
+    return;
+  }
   ESP_LOGI(TAG, "State saved; requesting %u-second deep sleep to preserve the 300-second BSEC2 cadence",
            sleep_ms / 1000);
   this->run_state_ = FINISHED;
