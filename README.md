@@ -170,3 +170,17 @@ Il driver e-paper è specifico del progetto e usa Adafruit GFX per comporre il
 framebuffer. Le scelte architetturali, la disposizione dello stato RTC e le
 indicazioni per proseguire lo sviluppo sono documentate in
 [`CONTEXT_HANDOFF.md`](CONTEXT_HANDOFF.md).
+
+## License
+
+Copyright 2026 alcor55 and contributors.
+
+Il codice originale, la configurazione e la documentazione di EnviroSenseCube
+sono distribuiti con licenza **Apache-2.0**. Il testo ufficiale integrale,
+senza condizioni aggiuntive, è in [LICENSE](LICENSE); le attribuzioni sono
+in [NOTICE](NOTICE).
+
+Il wrapper Bosch incluso conserva la licenza **BSD-3-Clause** e le sue
+attribuzioni. Il binario BSEC2 e le altre dipendenze di compilazione mantengono
+le proprie condizioni: non sono convertiti in Apache-2.0. Vedere
+[THIRD_PARTY.md](THIRD_PARTY.md) prima di redistribuire sorgenti o firmware.

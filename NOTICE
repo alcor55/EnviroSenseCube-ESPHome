@@ -1,0 +1,35 @@
+EnviroSenseCube
+Copyright 2026 alcor55 and contributors
+
+Original project repository:
+https://github.com/alcor55/EnviroSenseCube-ESPHome
+
+Original project code, configuration and documentation are licensed under
+the Apache License, Version 2.0. See LICENSE for the complete, unmodified text.
+Third-party material retains its own copyright, license and attribution.
+This NOTICE is informational and does not modify any license.
+
+Bosch Sensortec Arduino wrapper
+------------------------------
+Copyright (c) 2021 Bosch Sensortec GmbH. All rights reserved.
+
+components/envirosense_cube/sleep_aware_bsec2.h and sleep_aware_bsec2.cpp
+are modified versions of the BSD-3-Clause wrapper in Bosch-BSEC2-Library,
+tag 1.10.2610, commit 0dac6ea22739ed9d91442da5283f36133b86b771.
+The original license headers are retained. A separate copy of their terms
+is provided in licenses/BSD-3-Clause-Bosch.txt. Changes are described in
+components/envirosense_cube/BSEC_WRAPPER_NOTICE.md.
+Source: https://github.com/boschsensortec/Bosch-BSEC2-Library/tree/1.10.2610
+
+External build dependencies
+---------------------------
+The Bosch BSEC2 algorithm binary is not included in this source repository.
+It is obtained as a build dependency and remains subject to Bosch's own
+software license agreement, not Apache-2.0. The wrapper's BSD license must
+not be confused with the binary algorithm's license.
+
+ESPHome, the ESP8266 Arduino core, the BME68x driver and Adafruit libraries
+also retain their respective licenses. The Apache license for this project's
+original source does not replace the terms of those dependencies or establish
+that a compiled firmware image as a whole is Apache-2.0 licensed.
+See THIRD_PARTY.md for upstream sources and license locations.
